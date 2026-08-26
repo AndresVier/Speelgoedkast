@@ -395,7 +395,7 @@
   // Dit is een client-side controle die per-ongeluk-aangepaste of los-verzonnen links tegenhoudt — het is
   // GEEN waterdichte beveiliging, want deze sleutel staat mee in de publiek gehoste broncode (zie "Paginabron
   // weergeven"). Voor echte bescherming is een server-kant validatie nodig (optie B, later).
-  const LINK_SECRET = 'VERVANG_DIT_MET_EEN_EIGEN_GEHEIME_SLEUTEL_12345';
+  const LINK_SECRET = 'dgTuyMFUMQCdL7paz9bF9Mb8N5YwJYrsuOv2G0bAGrU';
 
   async function hmacSign(secret, message){
     const enc = new TextEncoder();

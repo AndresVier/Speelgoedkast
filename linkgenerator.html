@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Speelgoedotheek — linkgenerator</title>
+<link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@700;800&family=Nunito:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root{ --cream:#FBF6EC; --ink:#2B3A55; --brick:#E4572E; --mustard:#F0A700; --grass:#3F9142; --line:#E7DFCF; }
+  *{box-sizing:border-box;}
+  body{ background:var(--cream); font-family:'Nunito',sans-serif; color:var(--ink); margin:0; padding:24px 16px 60px; }
+  .wrap{ max-width:560px; margin:0 auto; }
+  h1{ font-family:'Baloo 2',sans-serif; font-size:26px; margin:0 0 6px; }
+  p.sub{ color:#5b6580; margin:0 0 24px; font-size:14px; }
+  .card{ background:white; border:2px solid var(--line); border-radius:16px; padding:20px; margin-bottom:16px; box-shadow:0 6px 0 rgba(43,58,85,0.08); }
+  label{ display:block; font-weight:700; font-size:13px; margin-bottom:6px; color:#5b6580; }
+  input{ width:100%; font-family:'Nunito',sans-serif; font-size:15px; padding:10px 12px; border:2px solid var(--line); border-radius:10px; margin-bottom:14px; }
+  button{ font-family:'Nunito',sans-serif; font-weight:800; font-size:14px; border:none; border-radius:10px; padding:10px 16px; cursor:pointer; }
+  .primary{ background:var(--brick); color:white; }
+  .result{ background:var(--cream); border:2px dashed var(--line); border-radius:10px; padding:12px; font-family:monospace; font-size:13px; word-break:break-all; margin-bottom:10px; }
+  .muted{ color:#8a92a8; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🔗 Linkgenerator</h1>
+  <p class="sub">Enkel voor wie de app uitrolt naar scholen — niet doorsturen naar leerkrachten. Vul in en geef de gegenereerde link door aan de school; die opent de app dan meteen met de juiste naam en pincode ingesteld, zonder zelf iets te moeten configureren.</p>
+
+  <div class="card">
+    <label>Basis-link naar de gehoste app (bv. https://jouwnaam.github.io/speelgoedotheek/)</label>
+    <input id="baseUrl" type="text" placeholder="https://...">
+    <label>Naam van de school</label>
+    <input id="schoolNaam" type="text" placeholder="bv. GBS De Regenboog">
+    <label>Pincode voor de leerkracht</label>
+    <input id="pin" type="text" placeholder="bv. 4821" value="1234">
+    <label>Google Sheets Apps Script-URL (optioneel — voor gedeelde opslag op meerdere toestellen, zie AppsScript-Code.gs)</label>
+    <input id="sheetsUrl" type="text" placeholder="https://script.google.com/macros/s/.../exec">
+    <button class="primary" onclick="genereer()">Genereer link</button>
+  </div>
+
+  <div id="output" style="display:none;">
+    <div class="card">
+      <label>Link om door te geven aan de school</label>
+      <div class="result" id="linkResult"></div>
+      <button onclick="kopieer()">📋 Kopieer link</button>
+      <p class="muted">Deze link bevat de schoolnaam en pincode zichtbaar in de URL — verstuur hem via een vertrouwd kanaal (bv. e-mail naar het @scholengroep-adres), niet publiek.</p>
+    </div>
+  </div>
+</div>
+
+<script>
+// LET OP: deze sleutel MOET identiek zijn aan LINK_SECRET in index.html.
+// Verander hem in beide bestanden naar iets unieks voor jullie eigen uitrol.
+const LINK_SECRET = 'VERVANG_DIT_MET_EEN_EIGEN_GEHEIME_SLEUTEL_12345';
+
+async function hmacSign(secret, message){
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(secret), {name:'HMAC', hash:'SHA-256'}, false, ['sign']);
+  const sigBuf = await crypto.subtle.sign('HMAC', key, enc.encode(message));
+  return Array.from(new Uint8Array(sigBuf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+
+async function genereer(){
+  const base = document.getElementById('baseUrl').value.trim().replace(/\/?$/, '/');
+  const school = document.getElementById('schoolNaam').value.trim();
+  const pin = document.getElementById('pin').value.trim();
+  const sheetsUrl = document.getElementById('sheetsUrl').value.trim();
+  if(!base || !school){ alert('Vul minstens de basis-link en de schoolnaam in.'); return; }
+  const sig = await hmacSign(LINK_SECRET, school + '|' + pin + '|' + sheetsUrl);
+  let url = base + '?school=' + encodeURIComponent(school) + (pin ? '&pin=' + encodeURIComponent(pin) : '');
+  if(sheetsUrl) url += '&sheets=' + encodeURIComponent(sheetsUrl);
+  url += '&sig=' + sig;
+  document.getElementById('linkResult').textContent = url;
+  document.getElementById('output').style.display = 'block';
+}
+function kopieer(){
+  const text = document.getElementById('linkResult').textContent;
+  navigator.clipboard.writeText(text).then(()=>alert('Link gekopieerd!'));
+}
+</script>
+</body>
+</html>

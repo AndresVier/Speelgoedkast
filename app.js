@@ -12,7 +12,7 @@
    *   4. Back-up (handmatig exporteren/importeren)
    *   5. Gedeelde opslag — Google Sheets (optioneel, multi-toestel)
    *   6. Gedeelde opslag — lokaal Excel-bestand (optioneel, Chrome/Edge)
-   *   7. Live verversen (multi-toestel polling, ~6s)
+   *   7. Live verversen (multi-toestel polling)
    *   8. Whitelabel: configuratie via ondertekende link
    *   9. Routing
    *  10. Onboarding-schermen & topbar
@@ -24,6 +24,7 @@
   // ==========================================================================
   // 1. STATE & CONFIGURATIE
   // ==========================================================================
+  const APP_VERSION = '1.0.0';
   const DEFAULT_CONFIG = { pin: "1234", schoolNaam: "", ingesteld: false, sheetsUrl: "" };
   let state = {
     config: DEFAULT_CONFIG,
@@ -32,6 +33,11 @@
     activeBeheerders: [], // array of student ids, kast open when length>0
     loans: []           // {id, toyId, studentId, beheerderIdUit, uitDatum, teruggegeven, beheerderIdTerug, terugDatum}
   };
+  let startupStatus = 'loading';
+  let startupError = '';
+  let startupUpdateVersion = '';
+  let startupUpdateError = '';
+  let startupCanInitializeEmpty = false;
   let route = "home";
   let adminUnlocked = false;
   let pendingBeheerderSelection = [];
@@ -61,6 +67,10 @@
   // 2. LOKALE OPSLAG (localStorage)
   // ==========================================================================
   const STORAGE_PREFIX = 'speelgoedotheek:';
+  let cloudWritesEnabled = false;
+  let cloudRevision = 0;
+  let cloudSyncError = '';
+  let cloudSyncQueue = Promise.resolve();
   function getData(key, fallback){
     try{
       const raw = localStorage.getItem(STORAGE_PREFIX + key);
@@ -68,10 +78,26 @@
     }catch(e){ return fallback; }
   }
   function setData(key, value){
-    try{ localStorage.setItem(STORAGE_PREFIX + key, JSON.stringify(value)); }
-    catch(e){ console.error('storage set failed', key, e); toast('Opslaan mislukt — is de browseropslag vol of uitgeschakeld?'); }
+    saveLocalData(key, value);
     scheduleFileSync();
     scheduleCloudSync();
+  }
+  function saveLocalData(key, value){
+    try{
+      localStorage.setItem(STORAGE_PREFIX + key, JSON.stringify(value));
+      return true;
+    }catch(e){
+      console.error('storage set failed', key, e);
+      toast('Opslaan mislukt — is de browseropslag vol of uitgeschakeld?');
+      return false;
+    }
+  }
+  function saveStateLocally(){
+    saveLocalData('config', state.config);
+    saveLocalData('students', state.students);
+    saveLocalData('toys', state.toys);
+    saveLocalData('activeBeheerders', state.activeBeheerders);
+    saveLocalData('loans', state.loans);
   }
   function uid(){ return (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()+Math.random())); }
 
@@ -95,11 +121,17 @@
     return d.toLocaleDateString('nl-BE', {day:'2-digit', month:'2-digit'}) + ' ' + d.toLocaleTimeString('nl-BE', {hour:'2-digit', minute:'2-digit'});
   }
 
-  function el(tag, cls, html){
+  function el(tag, cls, text){
     const e = document.createElement(tag);
     if(cls) e.className = cls;
-    if(html!==undefined) e.innerHTML = html;
+    if(text!==undefined) e.textContent = text;
     return e;
+  }
+  function appendTextCell(row, text){
+    const cell = document.createElement('td');
+    cell.textContent = text == null ? '' : String(text);
+    row.appendChild(cell);
+    return cell;
   }
 
   // ==========================================================================
@@ -134,30 +166,157 @@
   // ==========================================================================
   // 5. GEDEELDE OPSLAG — GOOGLE SHEETS (optioneel, multi-toestel)
   // ==========================================================================
+  const CLOUD_SYNC_DEBOUNCE_MS = 250;
   let cloudSyncTimer = null;
   let cloudSyncing = false;
-  function scheduleCloudSync(){
-    if(!state.config.sheetsUrl) return;
+  function setCloudSyncError(message){
+    cloudWritesEnabled = false;
+    cloudSyncError = message;
     clearTimeout(cloudSyncTimer);
-    cloudSyncTimer = setTimeout(()=>{ pushToSheets(state.config.sheetsUrl); }, 600);
+    cloudSyncTimer = null;
+    if(startupStatus === 'ready') updateCloudSyncErrorBanner();
+  }
+  function scheduleCloudSync(){
+    if(!state.config.sheetsUrl || !cloudWritesEnabled || cloudSyncError) return;
+    clearTimeout(cloudSyncTimer);
+    cloudSyncTimer = setTimeout(()=>{
+      cloudSyncTimer = null;
+      cloudSyncQueue = cloudSyncQueue
+        .then(()=>pushToSheets(state.config.sheetsUrl))
+        .catch(e=>{ console.error('kon niet synchroniseren met Google Sheets', e); });
+    }, CLOUD_SYNC_DEBOUNCE_MS);
   }
   async function pushToSheets(url){
+    if(!cloudWritesEnabled || cloudSyncError) throw new Error('Synchronisatie is gepauzeerd.');
+    const expectedRevision = cloudRevision;
+    const snapshot = JSON.parse(JSON.stringify(state));
+    const body = JSON.stringify({ appVersion: APP_VERSION, expectedRevision: expectedRevision, state: snapshot });
     try{
       cloudSyncing = true;
-      await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // vermijdt een CORS-preflight richting Apps Script
-        body: JSON.stringify(state)
-      });
-    }catch(e){ console.error('kon niet synchroniseren met Google Sheets', e); }
-    finally{ cloudSyncing = false; }
+      let result;
+      try{
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // vermijdt een CORS-preflight richting Apps Script
+          body: body
+        });
+        if(!res.ok) throw new Error('serverfout bij opslaan (' + res.status + ')');
+        result = await res.json();
+      }catch(postError){
+        // Apps Script kan het opslaan voltooien terwijl de browser de POST-respons niet kan lezen.
+        const remote = await fetchFromSheets(url);
+        const {_empty, _revision, _requiredAppVersion, ...remoteState} = remote;
+        if(_revision === expectedRevision + 1 && JSON.stringify(remoteState) === JSON.stringify(snapshot)){
+          cloudRevision = _revision;
+          return;
+        }
+        if(_revision > expectedRevision){
+          throw new Error('Een andere computer heeft intussen gegevens opgeslagen. Je wijzigingen zijn alleen lokaal bewaard.');
+        }
+        throw new Error('De server kon de opslag niet bevestigen: ' + postError.message);
+      }
+      if(result.updateRequired){
+        const error = new Error('Deze app-versie is verouderd. Werk de app bij om verder te gaan.');
+        error.code = 'app_update_required';
+        error.requiredAppVersion = result.requiredAppVersion;
+        throw error;
+      }
+      if(result.conflict){
+        throw new Error('Een andere computer heeft intussen gegevens opgeslagen. Je wijzigingen zijn alleen lokaal bewaard.');
+      }
+      if(!result.ok || !Number.isInteger(result.revision)){
+        throw new Error('De server heeft het opslaan niet bevestigd. Controleer de Apps Script-versie.');
+      }
+      cloudRevision = result.revision;
+    }catch(e){
+      setCloudSyncError(e.message || 'Onbekende synchronisatiefout.');
+      if(e.code === 'app_update_required'){
+        startupStatus = 'update-required';
+        startupUpdateVersion = e.requiredAppVersion;
+        startupError = e.message;
+        render();
+      }
+      throw e;
+    }finally{
+      cloudSyncing = false;
+    }
   }
-  async function fetchFromSheets(url){
-    const res = await fetch(url, { method:'GET' });
+  async function fetchFromSheets(url, sinceRevision){
+    if(Number.isInteger(sinceRevision)){
+      const requestUrl = new URL(url);
+      requestUrl.searchParams.set('since', String(sinceRevision));
+      url = requestUrl.toString();
+    }
+    const res = await fetch(url, { method:'GET', cache:'no-store' });
     if(!res.ok) throw new Error('serverfout bij ophalen (' + res.status + ')');
     const json = await res.json();
     if(!json || typeof json !== 'object') throw new Error('ongeldig antwoord');
-    return json;
+    if(json.protocol !== 1 || !Number.isInteger(json.revision) || typeof json.empty !== 'boolean'){
+      throw new Error('De Apps Script-backend moet worden bijgewerkt voordat veilige synchronisatie kan worden gebruikt.');
+    }
+    if(typeof json.requiredAppVersion !== 'string' || !/^\d+(\.\d+)*$/.test(json.requiredAppVersion)){
+      throw new Error('De Apps Script-backend moet worden bijgewerkt voordat app-versies kunnen worden gecontroleerd.');
+    }
+    if(compareVersions(APP_VERSION, json.requiredAppVersion) < 0){
+      const error = new Error('Deze app-versie is verouderd. Werk de app bij om verder te gaan.');
+      error.code = 'app_update_required';
+      error.requiredAppVersion = json.requiredAppVersion;
+      throw error;
+    }
+    if(json.unchanged === true){
+      return {
+        _unchanged: true,
+        _empty: false,
+        _revision: json.revision,
+        _requiredAppVersion: json.requiredAppVersion
+      };
+    }
+    if(json.empty) return {
+      _empty: true,
+      _revision: json.revision,
+      _requiredAppVersion: json.requiredAppVersion
+    };
+    if(!json.state || typeof json.state !== 'object') throw new Error('De gedeelde database bevat geen geldige gegevens.');
+    return {...json.state, _empty: false, _revision: json.revision, _requiredAppVersion: json.requiredAppVersion};
+  }
+  function compareVersions(left, right){
+    const a = left.split('.').map(Number);
+    const b = right.split('.').map(Number);
+    for(let i=0; i<Math.max(a.length,b.length); i++){
+      const difference = (a[i]||0) - (b[i]||0);
+      if(difference) return difference;
+    }
+    return 0;
+  }
+  function isValidSheetsState(remote){
+    return !remote._empty && Array.isArray(remote.students) &&
+      Array.isArray(remote.toys) && Array.isArray(remote.loans);
+  }
+  async function loadSheetsState(url, allowEmptyInitialization){
+    const remote = await fetchFromSheets(url);
+    if(!isValidSheetsState(remote)){
+      if(!allowEmptyInitialization || !remote._empty){
+        throw new Error('De gedeelde database bevat geen volledige gegevens.');
+      }
+      if(!window.confirm('De gedeelde Google Sheet is leeg. Wil je deze nu initialiseren met de gegevens die lokaal op dit toestel staan? Doe dit alleen als je zeker weet dat dit het juiste, nieuwe schoolbestand is.')){
+        throw new Error('Initialisatie van de lege gedeelde database is geannuleerd.');
+      }
+      cloudRevision = remote._revision;
+      cloudWritesEnabled = true;
+      cloudSyncError = '';
+      await pushToSheets(url);
+      return;
+    }
+    state = {
+      config: {...state.config, ...(remote.config||{}), sheetsUrl: url},
+      students: remote.students,
+      toys: remote.toys,
+      activeBeheerders: Array.isArray(remote.activeBeheerders) ? remote.activeBeheerders : [],
+      loans: remote.loans
+    };
+    cloudRevision = remote._revision;
+    cloudWritesEnabled = true;
+    cloudSyncError = '';
   }
 
   async function connectSheets(url){
@@ -165,20 +324,37 @@
     if(!url){ toast('Geef een geldige Apps Script-URL in.'); return; }
     try{
       const remote = await fetchFromSheets(url);
-      // een gloednieuw, nog leeg Sheet-document geeft {} terug — dan vertrekken we van de huidige lokale data
-      const looksEmpty = !remote.students && !remote.toys && !remote.loans;
-      if(!looksEmpty){
-        state = { config: {...state.config, ...(remote.config||{}), sheetsUrl: url}, students: remote.students||[], toys: remote.toys||[], activeBeheerders: remote.activeBeheerders||[], loans: remote.loans||[] };
-      } else {
+      if(remote._empty){
+        if(!window.confirm('De gedeelde Google Sheet is leeg. Wil je deze nu initialiseren met de gegevens die lokaal op dit toestel staan? Doe dit alleen als je zeker weet dat dit het juiste, nieuwe schoolbestand is.')){
+          return;
+        }
         state.config.sheetsUrl = url;
+        cloudRevision = remote._revision;
+        cloudWritesEnabled = true;
+        cloudSyncError = '';
+        saveStateLocally();
+        await pushToSheets(url);
+      } else {
+        if(!isValidSheetsState(remote)) throw new Error('De gedeelde database bevat geen volledige gegevens.');
+        state = {
+          config: {...state.config, ...(remote.config||{}), sheetsUrl: url},
+          students: remote.students,
+          toys: remote.toys,
+          activeBeheerders: Array.isArray(remote.activeBeheerders) ? remote.activeBeheerders : [],
+          loans: remote.loans
+        };
+        cloudRevision = remote._revision;
+        cloudWritesEnabled = true;
+        cloudSyncError = '';
+        saveStateLocally();
       }
-      setData('config', state.config); setData('students', state.students); setData('toys', state.toys);
-      setData('activeBeheerders', state.activeBeheerders); setData('loans', state.loans);
-      await pushToSheets(url);
       toast('Verbonden met Google Sheets.');
       render();
       startPolling();
-    }catch(e){ toast('Kon geen verbinding maken: ' + e.message); }
+    }catch(e){
+      console.error('kon niet verbinden met Google Sheets', e);
+      toast('Kon geen verbinding maken: ' + e.message);
+    }
   }
   function disconnectSheets(){
     state.config.sheetsUrl = '';
@@ -234,6 +410,7 @@
   }
 
   function buildWorkbook(){
+    if(typeof XLSX === 'undefined') throw new Error('Excel is niet beschikbaar. Verbind met internet en herlaad de app.');
     const wb = XLSX.utils.book_new();
     const leerlingenRows = state.students.map(s=>({
       Naam:s.naam, Leerjaar: s.leerjaar||'', Klasgroep: s.klasgroep||'',
@@ -265,6 +442,7 @@
   async function writeToFile(){
     if(!fileHandle) return;
     try{
+      if(typeof XLSX === 'undefined') throw new Error('Excel is niet beschikbaar. Verbind met internet en herlaad de app.');
       const perm = await fileHandle.requestPermission({mode:'readwrite'});
       if(perm !== 'granted') return;
       const wb = buildWorkbook();
@@ -280,6 +458,8 @@
     fileSyncTimer = setTimeout(()=>{ writeToFile(); }, 500);
   }
   async function loadFromFile(handle){
+    if(state.config.sheetsUrl) throw new Error('Ontkoppel eerst Google Sheets voordat je Excel als gegevensbron gebruikt.');
+    if(typeof XLSX === 'undefined') throw new Error('Excel is niet beschikbaar. Verbind met internet en herlaad de app.');
     const file = await handle.getFile();
     const buf = await file.arrayBuffer();
     const wb = XLSX.read(buf, {type:'array'});
@@ -295,6 +475,8 @@
   }
 
   async function linkNewFile(){
+    if(state.config.sheetsUrl){ toast('Ontkoppel eerst Google Sheets voordat je Excel als gegevensbron gebruikt.'); return; }
+    if(typeof XLSX === 'undefined'){ toast('Excel is niet beschikbaar. Verbind met internet en herlaad de app.'); return; }
     try{
       const handle = await window.showSaveFilePicker({
         suggestedName: (state.config.schoolNaam||'speelgoedotheek') + '-data.xlsx',
@@ -310,6 +492,8 @@
     }catch(e){ if(e.name!=='AbortError') toast('Kon geen bestand aanmaken: ' + e.message); }
   }
   async function linkExistingFile(){
+    if(state.config.sheetsUrl){ toast('Ontkoppel eerst Google Sheets voordat je Excel als gegevensbron gebruikt.'); return; }
+    if(typeof XLSX === 'undefined'){ toast('Excel is niet beschikbaar. Verbind met internet en herlaad de app.'); return; }
     try{
       const [handle] = await window.showOpenFilePicker({
         types: [{ description:'Excel-bestand', accept: {'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx']} }]
@@ -351,41 +535,70 @@
   }
 
   // ==========================================================================
-  // 7. LIVE VERVERSEN (multi-toestel polling, ~6s)
+  // 7. LIVE VERVERSEN (multi-toestel polling)
   // ==========================================================================
+  const POLL_INTERVAL_MS = 2000;
   let pollTimer = null;
+  let pollInFlight = false;
+  let visibilityListenerAttached = false;
   function snapshotKey(){
-    return JSON.stringify({ students: state.students, toys: state.toys, loans: state.loans, activeBeheerders: state.activeBeheerders });
+    return JSON.stringify({ config: state.config, students: state.students, toys: state.toys, loans: state.loans, activeBeheerders: state.activeBeheerders });
   }
   function startPolling(){
     if(pollTimer) clearInterval(pollTimer);
     pollTimer = null;
     if(!state.config.ingesteld) return;
     if(!state.config.sheetsUrl && !fileHandleConnected()) return;
-    pollTimer = setInterval(async ()=>{
-      // niet verversen terwijl iemand middenin een invoerveld typt, dat zou het overschrijven
-      const active = document.activeElement;
-      if(active && (active.tagName==='INPUT' || active.tagName==='TEXTAREA')) return;
-      const before = snapshotKey();
-      try{
-        if(state.config.sheetsUrl){
-          const remote = await fetchFromSheets(state.config.sheetsUrl);
-          if(remote && (remote.students || remote.toys || remote.loans || remote.activeBeheerders)){
-            state.students = remote.students||[]; state.toys = remote.toys||[];
-            state.loans = remote.loans||[]; state.activeBeheerders = remote.activeBeheerders||[];
-          }
-        } else if(fileHandleConnected()){
-          await loadFromFile(fileHandle);
-        }
-      }catch(e){ /* stil falen — volgende poging over 6s, laatst gekende stand blijft zichtbaar */ return; }
+    if(!visibilityListenerAttached){
+      document.addEventListener('visibilitychange', ()=>{
+        if(document.visibilityState === 'visible') pollSharedState();
+      });
+      visibilityListenerAttached = true;
+    }
+    pollSharedState();
+    pollTimer = setInterval(pollSharedState, POLL_INTERVAL_MS);
+  }
+  async function pollSharedState(){
+    if(pollInFlight || document.visibilityState === 'hidden') return;
+    // niet verversen terwijl iemand middenin een invoerveld typt, dat zou het overschrijven
+    const active = document.activeElement;
+    if(cloudSyncing || cloudSyncTimer || cloudSyncError) return;
+    if(active && (active.tagName==='INPUT' || active.tagName==='TEXTAREA')) return;
+    pollInFlight = true;
+    const before = snapshotKey();
+    try{
+      if(state.config.sheetsUrl){
+        const remote = await fetchFromSheets(state.config.sheetsUrl, cloudRevision);
+        if(remote._unchanged) return;
+        if(!isValidSheetsState(remote)) throw new Error('De gedeelde database bevat geen volledige gegevens.');
+        if(snapshotKey() !== before) return;
+        cloudRevision = remote._revision;
+        state.config = {...state.config, ...(remote.config||{}), sheetsUrl: state.config.sheetsUrl};
+        state.students = remote.students; state.toys = remote.toys;
+        state.loans = remote.loans;
+        state.activeBeheerders = Array.isArray(remote.activeBeheerders) ? remote.activeBeheerders : [];
+      } else if(fileHandleConnected()){
+        await loadFromFile(fileHandle);
+      }
       if(snapshotKey() !== before){
         if(state.config.sheetsUrl){
-          setData('students', state.students); setData('toys', state.toys);
-          setData('loans', state.loans); setData('activeBeheerders', state.activeBeheerders);
+          saveLocalData('config', state.config);
+          saveLocalData('students', state.students); saveLocalData('toys', state.toys);
+          saveLocalData('loans', state.loans); saveLocalData('activeBeheerders', state.activeBeheerders);
         }
         render();
       }
-    }, 6000);
+    }catch(e){
+      if(e.code === 'app_update_required'){
+        clearInterval(pollTimer);
+        startupError = e.message;
+        startupUpdateVersion = e.requiredAppVersion;
+        startupStatus = 'update-required';
+        render();
+      }
+    }finally{
+      pollInFlight = false;
+    }
   }
 
   // ==========================================================================
@@ -439,18 +652,178 @@
   function render(){
     const app = document.getElementById('app');
     app.innerHTML = '';
+    if(startupStatus !== 'ready'){
+      app.appendChild(viewStartupGate());
+      return;
+    }
     if(!state.config.ingesteld){
       if(linkConfigInvalid) app.appendChild(viewInvalidLink());
       else app.appendChild(pendingUrlConfig ? viewConfirmUrlConfig() : viewSetup());
       return;
     }
     app.appendChild(topbar());
+    if(cloudSyncError) app.appendChild(viewCloudSyncError());
     let body;
     if(route === 'home') body = viewHome();
     else if(route === 'beheerder') body = viewBeheerder();
     else if(route === 'overzicht') body = viewOverzicht();
     else if(route === 'admin') body = viewAdmin();
     app.appendChild(body);
+  }
+
+  function viewCloudSyncError(){
+    const card = el('div','card');
+    card.className = 'card cloud-sync-error';
+    card.style.borderColor = 'var(--overdue)';
+    card.appendChild(el('h2','', 'Synchronisatie gepauzeerd'));
+    card.appendChild(el('p','muted','Deze computer kon niet veilig opslaan. Je wijzigingen blijven lokaal bewaard, maar zijn nog niet gedeeld. Download eerst een back-up of laad daarna de nieuwste gedeelde versie.'));
+    const errorMessage = el('p','muted');
+    errorMessage.textContent = cloudSyncError;
+    card.appendChild(errorMessage);
+    const backupBtn = document.createElement('button');
+    backupBtn.className = 'secondary';
+    backupBtn.textContent = 'Back-up van deze computer downloaden';
+    backupBtn.onclick = exportBackup;
+    const reloadBtn = document.createElement('button');
+    reloadBtn.className = 'primary';
+    reloadBtn.style.marginLeft = '8px';
+    reloadBtn.textContent = 'Nieuwste gedeelde gegevens laden';
+    reloadBtn.onclick = reloadLatestCloudData;
+    card.appendChild(backupBtn);
+    card.appendChild(reloadBtn);
+    return card;
+  }
+
+  function updateCloudSyncErrorBanner(){
+    const app = document.getElementById('app');
+    const existing = app.querySelector('.cloud-sync-error');
+    if(existing) existing.remove();
+    if(cloudSyncError && state.config.ingesteld && app.firstElementChild){
+      app.insertBefore(viewCloudSyncError(), app.children[1] || null);
+    }
+  }
+
+  async function reloadLatestCloudData(){
+    if(!window.confirm('Dit vervangt de lokale gegevens op deze computer door de nieuwste gedeelde versie. Download eerst een back-up als je lokale wijzigingen wilt bewaren. Doorgaan?')){
+      return;
+    }
+    try{
+      const remote = await fetchFromSheets(state.config.sheetsUrl);
+      if(!isValidSheetsState(remote)) throw new Error('De gedeelde database bevat geen volledige gegevens.');
+      state = {
+        config: {...state.config, ...(remote.config||{}), sheetsUrl: state.config.sheetsUrl},
+        students: remote.students,
+        toys: remote.toys,
+        activeBeheerders: Array.isArray(remote.activeBeheerders) ? remote.activeBeheerders : [],
+        loans: remote.loans
+      };
+      cloudRevision = remote._revision;
+      saveStateLocally();
+      cloudSyncError = '';
+      cloudWritesEnabled = true;
+      render();
+      startPolling();
+    }catch(e){
+      console.error('kon niet laden van de nieuwste Google Sheets-gegevens', e);
+      cloudSyncError = e.message || 'De nieuwste gedeelde gegevens konden niet worden geladen.';
+      updateCloudSyncErrorBanner();
+    }
+  }
+
+  function viewStartupGate(){
+    const wrap = el('div');
+    const card = el('div','card lockscreen');
+    const updateRequired = startupStatus === 'update-required';
+    card.appendChild(el('div','icon',startupStatus === 'loading' ? '⏳' : '⚠️'));
+    card.appendChild(el('h1','page-title',startupStatus === 'loading' ? 'Gegevens laden…' : (updateRequired ? 'App-update vereist' : 'Geen verbinding met de gedeelde gegevens')));
+    card.appendChild(el('p','muted',startupStatus === 'loading'
+      ? 'De app wacht tot de gegevens uit Google Sheets volledig zijn geladen.'
+      : (updateRequired
+        ? 'Deze versie is verouderd en blijft gesloten om veilig gebruik te garanderen. Werk de app bij en probeer opnieuw.'
+        : 'De gegevens zijn niet volledig geladen. De app blijft gesloten zodat er niets wordt overschreven. Controleer je internetverbinding en probeer opnieuw.')));
+    if(updateRequired){
+      card.appendChild(el('p','muted','Huidige versie: ' + APP_VERSION + ' · Vereist: ' + startupUpdateVersion));
+      const updateBtn = document.createElement('button');
+      updateBtn.className = 'primary';
+      updateBtn.style.width = '100%';
+      updateBtn.textContent = 'App bijwerken en opnieuw laden';
+      updateBtn.onclick = updateApp;
+      card.appendChild(updateBtn);
+      if(startupUpdateError){
+        const updateError = el('p','muted');
+        updateError.textContent = startupUpdateError;
+        card.appendChild(updateError);
+      }
+    } else if(startupStatus === 'error'){
+      const retryBtn = document.createElement('button');
+      retryBtn.className = 'primary';
+      retryBtn.style.width = '100%';
+      retryBtn.textContent = 'Opnieuw proberen';
+      retryBtn.onclick = retryStartupLoad;
+      card.appendChild(retryBtn);
+      if(startupError){
+        const errorMessage = el('p','muted');
+        errorMessage.textContent = startupError;
+        card.appendChild(errorMessage);
+      }
+    }
+    wrap.appendChild(card);
+    return wrap;
+  }
+
+  async function updateApp(){
+    startupUpdateError = '';
+    try{
+      const registration = 'serviceWorker' in navigator ? await navigator.serviceWorker.getRegistration() : null;
+      if(registration){
+        await registration.update();
+        const worker = registration.installing || registration.waiting;
+        if(worker){
+          await new Promise(resolve=>{
+            if(worker.state === 'activated' || worker.state === 'redundant') return resolve();
+            const timeout = setTimeout(resolve, 10000);
+            worker.addEventListener('statechange', ()=>{
+              if(worker.state === 'activated' || worker.state === 'redundant'){
+                clearTimeout(timeout);
+                resolve();
+              }
+            });
+          });
+        }
+      }
+      window.location.reload();
+    }catch(e){
+      console.error('kon app-update niet controleren', e);
+      startupUpdateError = 'De update kon niet worden opgehaald. Controleer je internetverbinding en probeer opnieuw.';
+      render();
+    }
+  }
+
+  function setStartupLoadError(error){
+    startupError = error.message || 'Onbekende fout bij het laden.';
+    if(error.code === 'app_update_required'){
+      startupStatus = 'update-required';
+      startupUpdateVersion = error.requiredAppVersion;
+    } else {
+      startupStatus = 'error';
+    }
+  }
+
+  async function retryStartupLoad(){
+    startupStatus = 'loading';
+    startupError = '';
+    render();
+    try{
+      await loadSheetsState(state.config.sheetsUrl, startupCanInitializeEmpty);
+      startupCanInitializeEmpty = false;
+      startupStatus = 'ready';
+      render();
+      startPolling();
+    }catch(e){
+      console.error('kon niet laden van Google Sheets', e);
+      setStartupLoadError(e);
+      render();
+    }
   }
 
   // ==========================================================================
@@ -486,9 +859,18 @@
     const box = el('div','card');
     box.style.background = 'var(--paper)';
     box.style.textAlign = 'left';
-    box.innerHTML = '<b>Schoolnaam:</b> ' + pendingUrlConfig.schoolNaam + '<br>'
-      + '<b>Pincode:</b> ' + pendingUrlConfig.pin + '<br>'
-      + '<b>Gedeelde opslag:</b> ' + (pendingUrlConfig.sheetsUrl ? ('gekoppeld — ' + pendingUrlConfig.sheetsUrl) : 'niet gekoppeld, enkel lokaal op dit toestel');
+    [
+      ['Schoolnaam:', pendingUrlConfig.schoolNaam],
+      ['Pincode:', pendingUrlConfig.pin],
+      ['Gedeelde opslag:', pendingUrlConfig.sheetsUrl ? 'gekoppeld — ' + pendingUrlConfig.sheetsUrl : 'niet gekoppeld, enkel lokaal op dit toestel']
+    ].forEach(([label, value])=>{
+      const line = document.createElement('div');
+      const strong = document.createElement('b');
+      strong.textContent = label + ' ';
+      line.appendChild(strong);
+      line.appendChild(document.createTextNode(value));
+      box.appendChild(line);
+    });
     card.appendChild(box);
 
     const confirmBtn = document.createElement('button');
@@ -499,19 +881,24 @@
       setData('config', state.config);
       history.replaceState(null, '', window.location.pathname + window.location.hash);
       if(state.config.sheetsUrl){
+        startupStatus = 'loading';
+        startupCanInitializeEmpty = true;
+        render();
         try{
-          const remote = await fetchFromSheets(state.config.sheetsUrl);
-          if(remote && (remote.students || remote.toys || remote.loans)){
-            state = { ...state, students: remote.students||[], toys: remote.toys||[], activeBeheerders: remote.activeBeheerders||[], loans: remote.loans||[] };
-            setData('students', state.students); setData('toys', state.toys);
-            setData('activeBeheerders', state.activeBeheerders); setData('loans', state.loans);
-          }
-        }catch(e){ console.error('kon niet laden van Google Sheets', e); }
+          await loadSheetsState(state.config.sheetsUrl, true);
+          startupCanInitializeEmpty = false;
+          startupStatus = 'ready';
+        }catch(e){
+          console.error('kon niet laden van Google Sheets', e);
+          setStartupLoadError(e);
+        }
+      } else {
+        startupStatus = 'ready';
       }
       pendingUrlConfig = null;
-      toast('Welkom, ' + state.config.schoolNaam + '!');
+      if(startupStatus === 'ready') toast('Welkom, ' + state.config.schoolNaam + '!');
       render();
-      startPolling();
+      if(startupStatus === 'ready') startPolling();
     };
     card.appendChild(confirmBtn);
 
@@ -649,7 +1036,9 @@
 
     // kast is open
     const banner = el('div','banner');
-    banner.innerHTML = '<span>🔓 Kast open — beheerder(s): ' + state.activeBeheerders.map(studentName).join(', ') + '</span>';
+    const bannerLabel = document.createElement('span');
+    bannerLabel.textContent = '🔓 Kast open — beheerder(s): ' + state.activeBeheerders.map(studentName).join(', ');
+    banner.appendChild(bannerLabel);
     const closeBtn = document.createElement('button');
     closeBtn.className = 'secondary';
     closeBtn.textContent = 'Kast sluiten';
@@ -731,7 +1120,17 @@
         const overdue = isOverdue(l);
         const tr = document.createElement('tr');
         if(overdue) tr.style.background = '#FDEDE9';
-        tr.innerHTML = '<td>'+(toy?toy.naam:'?')+'</td><td>'+studentName(l.studentId)+'</td><td>'+fmtDate(l.uitDatum)+(overdue?' <span class="badge" style="background:var(--overdue); color:#fff;">te lang uit</span>':'')+'</td>';
+        appendTextCell(tr, toy ? toy.naam : '?');
+        appendTextCell(tr, studentName(l.studentId));
+        const sinceCell = appendTextCell(tr, fmtDate(l.uitDatum));
+        if(overdue){
+          const badge = document.createElement('span');
+          badge.className = 'badge';
+          badge.style.background = 'var(--overdue)';
+          badge.style.color = '#fff';
+          badge.textContent = ' te lang uit';
+          sinceCell.appendChild(badge);
+        }
         const td = document.createElement('td');
         const btn = document.createElement('button');
         btn.className = 'primary small'; btn.textContent = 'Teruggegeven';
@@ -780,7 +1179,14 @@
         const meta = t.categorie || '';
         const wieRegel = loansForToy.length>0 ? ('bij ' + loansForToy.map(l=>studentName(l.studentId)).join(', ') + (overdue?' ⚠️':'')) : '';
         const slot = el('div','slot ' + cls);
-        slot.innerHTML = '<div class="name">'+t.naam+'</div><div class="who">'+avail+' / '+aantal+' beschikbaar'+(meta?' · '+meta:'')+(wieRegel?'<br>'+wieRegel:'')+'</div>';
+        const name = el('div', 'name', t.naam);
+        const details = el('div', 'who', avail+' / '+aantal+' beschikbaar'+(meta?' · '+meta:''));
+        if(wieRegel){
+          details.appendChild(document.createElement('br'));
+          details.appendChild(document.createTextNode(wieRegel));
+        }
+        slot.appendChild(name);
+        slot.appendChild(details);
         shelf.appendChild(slot);
       });
       shelfCard.appendChild(shelf);
@@ -798,7 +1204,19 @@
       recent.forEach(l=>{
         const toy = state.toys.find(t=>t.id===l.toyId);
         const tr = document.createElement('tr');
-        tr.innerHTML = '<td>'+(toy?toy.naam:'?')+'</td><td>'+studentName(l.studentId)+'</td><td>'+fmtDate(l.uitDatum)+'</td><td>'+(l.teruggegeven? 'Terug ('+fmtDate(l.terugDatum)+')' : (isOverdue(l) ? '<b style="color:var(--overdue);">⚠️ Te lang uit</b>' : '<b>Nog buiten</b>'))+'</td>';
+        appendTextCell(tr, toy ? toy.naam : '?');
+        appendTextCell(tr, studentName(l.studentId));
+        appendTextCell(tr, fmtDate(l.uitDatum));
+        const statusCell = document.createElement('td');
+        if(l.teruggegeven){
+          statusCell.textContent = 'Terug ('+fmtDate(l.terugDatum)+')';
+        } else {
+          const status = document.createElement('b');
+          status.textContent = isOverdue(l) ? '⚠️ Te lang uit' : 'Nog buiten';
+          if(isOverdue(l)) status.style.color = 'var(--overdue)';
+          statusCell.appendChild(status);
+        }
+        tr.appendChild(statusCell);
         tbl.appendChild(tr);
       });
       histCard.appendChild(tbl);
@@ -958,8 +1376,12 @@
       filtered.slice().sort((a,b)=>a.naam.localeCompare(b.naam)).forEach(s=>{
         const tr = document.createElement('tr');
         if(s.actief===false) tr.style.opacity='0.55';
-        tr.innerHTML = '<td>'+s.naam+'</td><td>'+(s.leerjaar||'-')+'</td><td>'+(s.klasgroep||'-')+'</td><td>'+(s.kanBeheerder?'✅':'—')+'</td>'
-          + '<td>'+(s.actief===false?'Inactief':'Actief')+'</td><td>'+(s.opmerking||'')+'</td>';
+        appendTextCell(tr, s.naam);
+        appendTextCell(tr, s.leerjaar||'-');
+        appendTextCell(tr, s.klasgroep||'-');
+        appendTextCell(tr, s.kanBeheerder?'✅':'—');
+        appendTextCell(tr, s.actief===false?'Inactief':'Actief');
+        appendTextCell(tr, s.opmerking||'');
         const td = document.createElement('td');
         const toggleBtn = document.createElement('button'); toggleBtn.className='secondary small'; toggleBtn.textContent = s.actief===false ? 'Actief maken' : 'Inactief maken';
         toggleBtn.onclick = ()=>{
@@ -1044,8 +1466,8 @@
       tbl.innerHTML = '<tr><th>Naam</th><th>Categorie</th><th>Aantal</th><th>Beschikbaar</th><th></th></tr>';
       filtered.slice().sort((a,b)=>a.naam.localeCompare(b.naam)).forEach(t=>{
         const tr = document.createElement('tr');
-        const naamTd = '<td>'+t.naam+'</td><td>'+(t.categorie||'-')+'</td>';
-        tr.innerHTML = naamTd;
+        appendTextCell(tr, t.naam);
+        appendTextCell(tr, t.categorie||'-');
         const aantalTd = document.createElement('td');
         const aantalEdit = document.createElement('input'); aantalEdit.type='number'; aantalEdit.min='1'; aantalEdit.step='1';
         aantalEdit.value = t.aantal||1; aantalEdit.style.width='64px'; aantalEdit.style.padding='6px 8px';
@@ -1088,7 +1510,19 @@
       state.loans.slice().sort((a,b)=>new Date(b.uitDatum)-new Date(a.uitDatum)).forEach(l=>{
         const toy = state.toys.find(t=>t.id===l.toyId);
         const tr = document.createElement('tr');
-        tr.innerHTML = '<td>'+(toy?toy.naam:'(verwijderd)')+'</td><td>'+studentName(l.studentId)+'</td><td>'+beheerderNames(l.beheerderIdUit)+'</td><td>'+fmtDate(l.uitDatum)+'</td><td>'+(l.teruggegeven ? fmtDate(l.terugDatum)+' (via '+beheerderNames(l.beheerderIdTerug)+')' : '<b>nog buiten</b>')+'</td>';
+        appendTextCell(tr, toy ? toy.naam : '(verwijderd)');
+        appendTextCell(tr, studentName(l.studentId));
+        appendTextCell(tr, beheerderNames(l.beheerderIdUit));
+        appendTextCell(tr, fmtDate(l.uitDatum));
+        const returnedCell = document.createElement('td');
+        if(l.teruggegeven){
+          returnedCell.textContent = fmtDate(l.terugDatum)+' (via '+beheerderNames(l.beheerderIdTerug)+')';
+        } else {
+          const notReturned = document.createElement('b');
+          notReturned.textContent = 'nog buiten';
+          returnedCell.appendChild(notReturned);
+        }
+        tr.appendChild(returnedCell);
         tbl.appendChild(tr);
       });
       card.appendChild(tbl);
@@ -1116,7 +1550,12 @@
     toyCard.appendChild(el('h2','🏆 Populairste speelgoed'));
     const toyTbl = document.createElement('table');
     toyTbl.innerHTML = '<tr><th>Speelgoed</th><th>Aantal keer ontleend</th></tr>';
-    topToys.forEach(t=>{ const tr=document.createElement('tr'); tr.innerHTML='<td>'+t.naam+'</td><td>'+t.count+'</td>'; toyTbl.appendChild(tr); });
+    topToys.forEach(t=>{
+      const tr=document.createElement('tr');
+      appendTextCell(tr, t.naam);
+      appendTextCell(tr, t.count);
+      toyTbl.appendChild(tr);
+    });
     toyCard.appendChild(toyTbl);
     wrap.appendChild(toyCard);
 
@@ -1131,7 +1570,12 @@
       const avgMs = totalMs / teruggegeven.length;
       const avgMin = Math.round(avgMs / 60000);
       const label = avgMin < 60 ? (avgMin + ' minuten') : avgMin < 1440 ? (Math.round(avgMin/60*10)/10 + ' uur') : (Math.round(avgMin/1440*10)/10 + ' dagen');
-      durCard.appendChild(el('p','', '<b>' + label + '</b> gemiddeld, over ' + teruggegeven.length + ' teruggegeven ontleningen.'));
+      const average = el('p');
+      const averageValue = document.createElement('b');
+      averageValue.textContent = label;
+      average.appendChild(averageValue);
+      average.appendChild(document.createTextNode(' gemiddeld, over ' + teruggegeven.length + ' teruggegeven ontleningen.'));
+      durCard.appendChild(average);
     }
     wrap.appendChild(durCard);
 
@@ -1146,7 +1590,12 @@
     leerjaarCard.appendChild(el('h2','🏫 Ontleningen per leerjaar'));
     const ljTbl = document.createElement('table');
     ljTbl.innerHTML = '<tr><th>Leerjaar</th><th>Aantal ontleningen</th></tr>';
-    Object.entries(perLeerjaar).sort((a,b)=>b[1]-a[1]).forEach(([k,v])=>{ const tr=document.createElement('tr'); tr.innerHTML='<td>'+k+'</td><td>'+v+'</td>'; ljTbl.appendChild(tr); });
+    Object.entries(perLeerjaar).sort((a,b)=>b[1]-a[1]).forEach(([k,v])=>{
+      const tr=document.createElement('tr');
+      appendTextCell(tr, k);
+      appendTextCell(tr, v);
+      ljTbl.appendChild(tr);
+    });
     leerjaarCard.appendChild(ljTbl);
     wrap.appendChild(leerjaarCard);
 
@@ -1155,7 +1604,7 @@
 
   function adminInstellingen(){
     const card = el('div','card');
-    card.appendChild(el('h2','School &amp; pincode'));
+    card.appendChild(el('h2','School & pincode'));
     const row = el('div','row');
     const d0 = el('div'); d0.appendChild(el('label','field','Schoolnaam'));
     const naamInput = document.createElement('input'); naamInput.type='text'; naamInput.value = state.config.schoolNaam || '';
@@ -1180,7 +1629,11 @@
     sheetsCard.appendChild(el('h2','🌐 Gedeelde online opslag (Google Sheets)'));
     sheetsCard.appendChild(el('p','muted','Werkt op elk toestel — ook tablets en Chromebooks — en houdt alle PC\'s meteen up-to-date. Vereist eenmalig een gratis Google Sheet + Apps Script-koppeling (zie README).'));
     if(state.config.sheetsUrl){
-      sheetsCard.appendChild(el('div','','<b>✅ Gekoppeld</b><br><span class="muted">'+state.config.sheetsUrl+'</span>'));
+      const connected = el('div');
+      connected.appendChild(el('b','','✅ Gekoppeld'));
+      connected.appendChild(document.createElement('br'));
+      connected.appendChild(el('span','muted',state.config.sheetsUrl));
+      sheetsCard.appendChild(connected);
       const dcBtn = document.createElement('button'); dcBtn.className='danger'; dcBtn.style.marginTop='10px'; dcBtn.textContent='Ontkoppelen';
       dcBtn.onclick = ()=>disconnectSheets();
       sheetsCard.appendChild(dcBtn);
@@ -1200,14 +1653,27 @@
     if(!FS_SUPPORTED){
       fileCard.appendChild(el('div','empty','Deze browser ondersteunt geen bestandskoppeling. Gebruik Chrome of Edge voor deze functie — de gewone back-up hierboven blijft wel altijd werken.'));
     } else {
-      fileCard.appendChild(el('p','muted','Koppel de app aan een .xlsx-bestand dat je bewaart in je OneDrive-map van de scholengroep. Elke wijziging wordt automatisch weggeschreven — jullie eigen OneDrive zorgt dan voor de back-up naar de cloud van de scholengroep, zonder dat deze app zelf iets online stuurt.'));
+      fileCard.appendChild(el('p','muted','Koppel de app aan een .xlsx-bestand dat je bewaart in je OneDrive-map van de scholengroep. Elke wijziging wordt automatisch weggeschreven — jullie eigen OneDrive zorgt dan voor de back-up naar de cloud van de scholengroep, zonder dat deze app zelf iets online stuurt. Ontkoppel eerst Google Sheets als je Excel als gegevensbron wilt gebruiken.'));
+      const xlsxUnavailable = typeof XLSX === 'undefined';
+      if(xlsxUnavailable){
+        fileCard.appendChild(el('div','empty','Excel-functies zijn momenteel niet beschikbaar. De Excel-bibliotheek wordt via internet geladen; verbind met internet en herlaad de app om een Excel-bestand te koppelen of bij te werken. De app blijft bruikbaar, maar wijzigingen worden intussen niet naar een gekoppeld Excel-bestand geschreven.'));
+      }
       const statusRow = el('div','row');
       if(fileHandleConnected()){
-        statusRow.appendChild(el('div','','<b>✅ Gekoppeld aan:</b> ' + fileHandle.name));
+        const status = el('div');
+        status.appendChild(el('b','','✅ Gekoppeld aan:'));
+        status.appendChild(document.createTextNode(' ' + fileHandle.name));
+        statusRow.appendChild(status);
       } else if(fileHandle){
-        statusRow.appendChild(el('div','','<b>⚠️ Verbinding verbroken</b> met ' + fileHandle.name + ' — klik om te herstellen.'));
+        const status = el('div');
+        status.appendChild(el('b','','⚠️ Verbinding verbroken'));
+        status.appendChild(document.createTextNode(' met ' + fileHandle.name + ' — klik om te herstellen.'));
+        statusRow.appendChild(status);
       } else {
-        statusRow.appendChild(el('div','','<b>Niet gekoppeld</b> — data zit enkel lokaal in deze browser.'));
+        const status = el('div');
+        status.appendChild(el('b','','Niet gekoppeld'));
+        status.appendChild(document.createTextNode(' — data zit enkel lokaal in deze browser.'));
+        statusRow.appendChild(status);
       }
       fileCard.appendChild(statusRow);
       statusRow.style.marginBottom = '14px';
@@ -1215,7 +1681,10 @@
       const btnRow = el('div','row');
       if(fileHandle && !fileHandleConnected()){
         const reconnectBtn = document.createElement('button'); reconnectBtn.className='primary'; reconnectBtn.textContent='🔄 Verbinding herstellen';
+        reconnectBtn.disabled = xlsxUnavailable;
         reconnectBtn.onclick = async ()=>{
+          if(typeof XLSX === 'undefined'){ toast('Excel is niet beschikbaar. Verbind met internet en herlaad de app.'); return; }
+          if(state.config.sheetsUrl){ toast('Ontkoppel eerst Google Sheets voordat je Excel als gegevensbron gebruikt.'); return; }
           try{
             const perm = await fileHandle.requestPermission({mode:'readwrite'});
             if(perm==='granted'){ fileHandlePermGranted = true; await loadFromFile(fileHandle); toast('Verbinding hersteld.'); render(); startPolling(); }
@@ -1225,8 +1694,10 @@
         btnRow.appendChild(reconnectBtn);
       }
       const newBtn = document.createElement('button'); newBtn.className='secondary'; newBtn.textContent='📁 Nieuw bestand aanmaken';
+      newBtn.disabled = xlsxUnavailable;
       newBtn.onclick = ()=>linkNewFile();
       const existBtn = document.createElement('button'); existBtn.className='secondary'; existBtn.textContent='📂 Bestaand bestand kiezen';
+      existBtn.disabled = xlsxUnavailable;
       existBtn.onclick = ()=>linkExistingFile();
       btnRow.appendChild(newBtn); btnRow.appendChild(existBtn);
       if(fileHandle){
@@ -1271,15 +1742,20 @@
   // ==========================================================================
   (async function init(){
     loadAll();
+    render();
     await applyUrlConfig();
-    if(state.config.sheetsUrl){
-      try{ const remote = await fetchFromSheets(state.config.sheetsUrl);
-        if(remote && (remote.students || remote.toys || remote.loans)){
-          state = { config: {...state.config, ...(remote.config||{}), sheetsUrl: state.config.sheetsUrl}, students: remote.students||[], toys: remote.toys||[], activeBeheerders: remote.activeBeheerders||[], loans: remote.loans||[] };
-        }
-      }catch(e){ console.error('kon niet laden van Google Sheets, val terug op lokale kopie', e); }
+    if(state.config.ingesteld && state.config.sheetsUrl){
+      try{
+        await loadSheetsState(state.config.sheetsUrl, false);
+        startupStatus = 'ready';
+      }catch(e){
+        console.error('kon niet laden van Google Sheets', e);
+        setStartupLoadError(e);
+      }
+    } else {
+      startupStatus = 'ready';
     }
-    await tryReconnectOnStartup();
+    if(!state.config.sheetsUrl) await tryReconnectOnStartup();
     render();
     startPolling();
     if('serviceWorker' in navigator){

@@ -15,25 +15,81 @@
  *
  * Nadien blijft de data leesbaar/aanpasbaar in dit Google Sheet zelf,
  * op de tabbladen "Leerlingen", "Speelgoed" en "Geschiedenis". Het
- * tabblad "_data" bevat de technische kopie — niet manueel aanpassen.
+ * tabblad "_data" bevat de technische opslag en revisie — niet manueel aanpassen.
+ * Bij updates: bewerk de bestaande webapp-implementatie en publiceer een nieuwe versie,
+ * zodat de bestaande /exec-URL behouden blijft.
+ * Verhoog REQUIRED_APP_VERSION wanneer een nieuwe app-versie verplicht moet worden.
  */
 
+var REQUIRED_APP_VERSION = '1.0.0';
+
 function doGet(e) {
-  var sheet = getDataSheet_();
-  var json = sheet.getRange('A1').getValue() || '{}';
-  return ContentService.createTextOutput(json).setMimeType(ContentService.MimeType.JSON);
+  var stored = readStoredData_();
+  var response = {
+    protocol: 1,
+    requiredAppVersion: REQUIRED_APP_VERSION,
+    revision: stored.revision,
+    empty: stored.empty
+  };
+  var since = e && e.parameter ? Number(e.parameter.since) : NaN;
+  if (!stored.empty && Number.isInteger(since) && since === stored.revision) {
+    response.unchanged = true;
+  } else {
+    response.unchanged = false;
+    response.state = stored.state;
+  }
+  return jsonOutput_(response);
 }
 
 function doPost(e) {
-  var sheet = getDataSheet_();
-  var body = e.postData ? e.postData.contents : '{}';
-  sheet.getRange('A1').setValue(body);
+  var payload;
   try {
-    updateReadableSheets_(JSON.parse(body));
+    payload = JSON.parse(e.postData.contents);
   } catch (err) {
-    // leesbare tabbladen zijn een bonus; als dit faalt blijft de technische data toch correct opgeslagen
+    return jsonOutput_({ ok: false, error: 'invalid_json' });
   }
-  return ContentService.createTextOutput(JSON.stringify({ ok: true })).setMimeType(ContentService.MimeType.JSON);
+
+  if (!payload || !Number.isInteger(payload.expectedRevision) ||
+      !isValidAppVersion_(payload.appVersion) || !isValidState_(payload.state)) {
+    return jsonOutput_({ ok: false, error: 'invalid_request' });
+  }
+  if (compareVersions_(payload.appVersion, REQUIRED_APP_VERSION) < 0) {
+    return jsonOutput_({
+      ok: false,
+      updateRequired: true,
+      requiredAppVersion: REQUIRED_APP_VERSION
+    });
+  }
+
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    var stored = readStoredData_();
+    if (!stored.empty && !isValidState_(stored.state)) {
+      return jsonOutput_({ ok: false, error: 'stored_data_invalid' });
+    }
+    if (payload.expectedRevision !== stored.revision) {
+      return jsonOutput_({ ok: false, conflict: true, revision: stored.revision });
+    }
+
+    var nextRevision = stored.revision + 1;
+    getDataSheet_().getRange('A1').setValue(JSON.stringify({
+      protocol: 1,
+      revision: nextRevision,
+      state: payload.state
+    }));
+
+    var viewsUpdated = true;
+    try {
+      updateReadableSheets_(payload.state);
+    } catch (err) {
+      viewsUpdated = false;
+      console.error('De gegevens zijn opgeslagen, maar de leesbare tabbladen konden niet worden bijgewerkt.', err);
+    }
+    return jsonOutput_({ ok: true, revision: nextRevision, viewsUpdated: viewsUpdated });
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function getDataSheet_() {
@@ -45,6 +101,64 @@ function getDataSheet_() {
     sheet.getRange('A1').setValue('{}');
   }
   return sheet;
+}
+
+function readStoredData_() {
+  var raw = getDataSheet_().getRange('A1').getValue();
+  if (!raw) return { state: null, revision: 0, empty: true };
+
+  var parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    return { state: null, revision: 0, empty: false };
+  }
+
+  if (!parsed || typeof parsed !== 'object') {
+    return { state: parsed, revision: 0, empty: false };
+  }
+
+  if (parsed && parsed.protocol === 1 && Number.isInteger(parsed.revision)) {
+    return {
+      state: parsed.state,
+      revision: parsed.revision,
+      empty: false
+    };
+  }
+
+  if (Object.keys(parsed).length === 0) {
+    return { state: null, revision: 0, empty: true };
+  }
+
+  return {
+    state: parsed,
+    revision: 1,
+    empty: false
+  };
+}
+
+function isValidState_(state) {
+  return state && Array.isArray(state.students) &&
+    Array.isArray(state.toys) && Array.isArray(state.loans);
+}
+
+function isValidAppVersion_(version) {
+  return typeof version === 'string' && /^\d+(\.\d+)*$/.test(version);
+}
+
+function compareVersions_(left, right) {
+  var a = left.split('.').map(Number);
+  var b = right.split('.').map(Number);
+  for (var i = 0; i < Math.max(a.length, b.length); i++) {
+    var difference = (a[i] || 0) - (b[i] || 0);
+    if (difference) return difference;
+  }
+  return 0;
+}
+
+function jsonOutput_(value) {
+  return ContentService.createTextOutput(JSON.stringify(value))
+    .setMimeType(ContentService.MimeType.JSON);
 }
 
 function updateReadableSheets_(state) {

@@ -28,12 +28,15 @@ ooit nodig blijkt.
 ## 2. Per school: gedeelde opslag instellen (aanbevolen als er ook tablets/Chromebooks gebruikt worden)
 Werkt de school enkel met vaste Windows-PC's met OneDrive? Dan volstaat de lokale Excel-koppeling
 in de app zelf (Instellingen → Excel-bestand koppelen) en kan je deze stap overslaan.
+De Excel-bestandskoppeling laadt haar bibliotheek via internet en vereist daarom een internetverbinding wanneer je Excel koppelt of gebruikt. Als die bibliotheek niet beschikbaar is, meldt de app dit en schakelt ze de Excel-acties uit; de overige app-functies blijven beschikbaar.
 
 Zijn er ook tablets/Chromebooks bij? Zet dan **per school** een gratis Google Sheets-backend op:
 1. Maak een nieuw, leeg Google Sheet-document aan.
 2. Extensies > Apps Script, plak de inhoud van `AppsScript-Code.gs` (zie dat bestand voor de volledige uitleg).
 3. Implementeren > Nieuwe implementatie > type "Webapp" > Uitvoeren als "Ik" > Toegang "Iedereen" > Implementeren.
 4. Kopieer de webapp-URL (eindigt op `/exec`) — dat vul je in bij stap 3 hieronder.
+
+**Bestaande Apps Script-installatie veilig bijwerken:** maak eerst een kopie van het Google Sheet-document als back-up. Open daarna het bestaande Apps Script-project, vervang de code door de huidige inhoud van `AppsScript-Code.gs`, en kies **Implementeren > Implementaties beheren**. Bewerk de bestaande webapp-implementatie, kies bij Versie **Nieuwe versie**, en klik **Implementeren**. Zo blijft de bestaande `/exec`-URL behouden. Werk daarna de app bij en open/refresh de nieuwe versie op alle gebruikte computers. Oudere app-versies begrijpen het revisie- en app-versieprotocol niet en hun writes worden door de bijgewerkte backend afgewezen. De nieuwe app en backend gebruiken versienummers om te voorkomen dat een computer met verouderde gegevens de gedeelde database overschrijft. De eerste keer dat de bijgewerkte app een lege Sheet vindt, vraagt ze expliciet toestemming om die te initialiseren.
 
 ## 3. Per school een link genereren
 Open `linkgenerator.html` lokaal in je browser (gewoon dubbelklikken, hoeft niet online te staan).
@@ -50,10 +53,12 @@ echte app "installeren".
 ## 4. Een bestaande installatie bijwerken
 Als je later de app verbetert: upload de nieuwe bestanden gewoon opnieuw naar dezelfde GitHub-repository.
 Scholen die de app als PWA geïnstalleerd hebben, krijgen de update automatisch bij hun volgende bezoek (dankzij de service worker) — niemand moet iets opnieuw downloaden of instellen.
+Gebruikt de school Google Sheets, werk dan ook het Apps Script bij volgens stap 2. De computer toont een waarschuwing en pauzeert synchronisatie zolang de app en backend niet compatibel zijn. Na een conflict blijven wijzigingen lokaal bewaard: download eerst een back-up en laad daarna bewust de nieuwste gedeelde gegevens, of herstel de wijzigingen handmatig.
+Voor een verplichte app-update verhoog je `APP_VERSION` in `app.js`, dezelfde waarde als `REQUIRED_APP_VERSION` in `AppsScript-Code.gs`, en ook de cacheversie (`CACHE_NAME`) in `sw.js`. Deploy eerst de Apps Script-versie met de nieuwe vereiste versie; oude app-versies worden dan geblokkeerd en naar een update gevraagd. Publiceer vervolgens de app-bestanden. De updateknop controleert op service-worker updates en herlaadt de app.
+De app controleert Google Sheets elke 2 seconden zolang het venster zichtbaar is en vraagt alleen de volledige gegevens op als de revisie veranderd is. Na deze poll-optimalisatie moet ook `AppsScript-Code.gs` opnieuw als nieuwe webapp-versie worden gedeployed; gebruik bij de bestaande deployment dezelfde `REQUIRED_APP_VERSION`.
 
 ## Let op
 - De linkparameters (schoolnaam/pincode/sheets-URL) zijn zichtbaar in de URL zelf — verstuur ze via een vertrouwd kanaal (bv. e-mail naar het school-domein), niet via een publiek kanaal.
 - De pincode is enkel een lichte drempel tegen nieuwsgierige leerlingen, geen echte beveiliging.
 - Elke school heeft een eigen Google Sheet (of eigen Excel-bestand) — er wordt niets gedeeld tussen scholen, ook niet via deze gedeelde hosting.
 - De Apps Script-URL zelf is wel gevoelig: wie die URL kent, kan in principe de data van die school lezen/schrijven. Behandel hem dus als een wachtwoord — niet publiek delen.
-

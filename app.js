@@ -24,7 +24,7 @@
   // ==========================================================================
   // 1. STATE & CONFIGURATIE
   // ==========================================================================
-  const APP_VERSION = '1.2.0';
+  const APP_VERSION = '1.2.1';
   const DEFAULT_CONFIG = { pin: "1234", schoolNaam: "", ingesteld: false, sheetsUrl: "" };
   let state = {
     config: DEFAULT_CONFIG,

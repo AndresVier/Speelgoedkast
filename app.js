@@ -947,8 +947,14 @@
   function topbar(){
     const bar = document.createElement('div');
     bar.className = 'topbar';
-    const brandLabel = '<span class="crate"></span> Speelgoedotheek' + (state.config.schoolNaam ? ' <span class="badge" style="vertical-align:middle;">'+state.config.schoolNaam+'</span>' : '');
-    const brand = el('div', 'brand', brandLabel);
+    const brand = el('div', 'brand');
+    brand.appendChild(el('span', 'crate'));
+    brand.appendChild(document.createTextNode(' Speelgoedotheek'));
+    if(state.config.schoolNaam){
+      const school = el('span', 'badge', state.config.schoolNaam);
+      school.style.verticalAlign = 'middle';
+      brand.appendChild(school);
+    }
     brand.onclick = ()=>go('home');
     const nav = document.createElement('nav');
     nav.className = 'crumbs';

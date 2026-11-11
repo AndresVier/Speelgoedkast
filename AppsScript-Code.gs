@@ -21,7 +21,7 @@
  * Verhoog REQUIRED_APP_VERSION wanneer een nieuwe app-versie verplicht moet worden.
  */
 
-var REQUIRED_APP_VERSION = '1.0.0';
+var REQUIRED_APP_VERSION = '1.1.0';
 
 function doGet(e) {
   var stored = readStoredData_();

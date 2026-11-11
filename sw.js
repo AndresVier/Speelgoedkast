@@ -1,4 +1,4 @@
-const CACHE_NAME = 'speelgoedotheek-v9';
+const CACHE_NAME = 'speelgoedotheek-v11';
 const FILES = ['./index.html', './manifest.json', './icon.svg', './styles.css', './app.js'];
 
 self.addEventListener('install', (event) => {

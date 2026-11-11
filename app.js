@@ -24,7 +24,7 @@
   // ==========================================================================
   // 1. STATE & CONFIGURATIE
   // ==========================================================================
-  const APP_VERSION = '1.0.0';
+  const APP_VERSION = '1.2.0';
   const DEFAULT_CONFIG = { pin: "1234", schoolNaam: "", ingesteld: false, sheetsUrl: "" };
   let state = {
     config: DEFAULT_CONFIG,
@@ -225,7 +225,13 @@
       const ids = new Set([...maps[2].keys(), ...maps[1].keys(), ...maps[0].keys()]);
       const merged = [];
       ids.forEach(id=>{
-        const item = mergeThreeWay(maps[0].get(id), maps[1].get(id), maps[2].get(id), path + '[' + id + ']');
+        const baseItem = maps[0].get(id);
+        const localItem = maps[1].get(id);
+        const remoteItem = maps[2].get(id);
+        const item = path === 'ontleningen' && baseItem && !baseItem.teruggegeven &&
+          localItem && localItem.teruggegeven && remoteItem && remoteItem.teruggegeven
+          ? mergeConcurrentLoanReturns(baseItem, localItem, remoteItem, path + '[' + id + ']')
+          : mergeThreeWay(baseItem, localItem, remoteItem, path + '[' + id + ']');
         if(item !== undefined) merged.push(item);
       });
       return merged;
@@ -257,6 +263,28 @@
         merged.push(values.get(key));
         mergedKeys.delete(key);
       }
+    });
+    return merged;
+  }
+  function mergeConcurrentLoanReturns(base, local, remote, path){
+    const localDate = Date.parse(local.terugDatum);
+    const remoteDate = Date.parse(remote.terugDatum);
+    const localKey = Number.isNaN(localDate) ? Infinity : localDate;
+    const remoteKey = Number.isNaN(remoteDate) ? Infinity : remoteDate;
+    const returnedBy = localKey < remoteKey ||
+      (localKey === remoteKey && stableStringify(local.beheerderIdTerug) <= stableStringify(remote.beheerderIdTerug))
+      ? local
+      : remote;
+    const merged = {};
+    const keys = new Set([...Object.keys(base), ...Object.keys(local), ...Object.keys(remote)]);
+    keys.forEach(key=>{
+      if(key === 'terugDatum' || key === 'beheerderIdTerug'){
+        const value = returnedBy[key];
+        if(value !== undefined) merged[key] = cloneValue(value);
+        return;
+      }
+      const value = mergeThreeWay(base[key], local[key], remote[key], path + '.' + key);
+      if(value !== undefined) merged[key] = value;
     });
     return merged;
   }
@@ -1791,6 +1819,10 @@
     row.appendChild(d0); row.appendChild(d1); row.appendChild(d2);
     card.appendChild(row);
 
+    const versionCard = el('div','card');
+    versionCard.appendChild(el('h2','App-versie'));
+    versionCard.appendChild(el('p','muted','Deze computer gebruikt versie ' + APP_VERSION + '.'));
+
     const sheetsCard = el('div','card');
     sheetsCard.appendChild(el('h2','🌐 Gedeelde online opslag (Google Sheets)'));
     sheetsCard.appendChild(el('p','muted','Werkt op elk toestel — ook tablets en Chromebooks — en houdt alle PC\'s meteen up-to-date. Vereist eenmalig een gratis Google Sheet + Apps Script-koppeling (zie README).'));
@@ -1899,7 +1931,7 @@
     };
     resetCard.appendChild(resetBtn);
 
-    const wrap = el('div'); wrap.appendChild(card); wrap.appendChild(sheetsCard); wrap.appendChild(fileCard); wrap.appendChild(backupCard); wrap.appendChild(resetCard);
+    const wrap = el('div'); wrap.appendChild(card); wrap.appendChild(versionCard); wrap.appendChild(sheetsCard); wrap.appendChild(fileCard); wrap.appendChild(backupCard); wrap.appendChild(resetCard);
     return wrap;
   }
 

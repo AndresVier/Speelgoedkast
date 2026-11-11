@@ -69,6 +69,7 @@
   const STORAGE_PREFIX = 'speelgoedotheek:';
   let cloudWritesEnabled = false;
   let cloudRevision = 0;
+  let cloudBaseState = null;
   let cloudSyncError = '';
   let cloudSyncQueue = Promise.resolve();
   function getData(key, fallback){
@@ -169,6 +170,129 @@
   const CLOUD_SYNC_DEBOUNCE_MS = 250;
   let cloudSyncTimer = null;
   let cloudSyncing = false;
+  function cloneValue(value){
+    return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+  }
+  function stableStringify(value){
+    if(value === undefined) return 'undefined';
+    if(value === null || typeof value !== 'object') return JSON.stringify(value);
+    if(Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
+    return '{' + Object.keys(value).sort()
+      .filter(key=>value[key] !== undefined)
+      .map(key=>JSON.stringify(key) + ':' + stableStringify(value[key])).join(',') + '}';
+  }
+  function valuesEqual(a, b){ return stableStringify(a) === stableStringify(b); }
+  function cloudDataFromState(value){
+    return {
+      students: cloneValue(value.students),
+      toys: cloneValue(value.toys),
+      loans: cloneValue(value.loans)
+    };
+  }
+  function mergeThreeWay(base, local, remote, path){
+    if(valuesEqual(local, base)) return cloneValue(remote);
+    if(valuesEqual(remote, base) || valuesEqual(local, remote)) return cloneValue(local);
+    if(Array.isArray(base) && Array.isArray(local) && Array.isArray(remote)){
+      return mergeArrayThreeWay(base, local, remote, path);
+    }
+    if(isPlainObject(base) && isPlainObject(local) && isPlainObject(remote)){
+      const merged = {};
+      const keys = new Set([...Object.keys(base), ...Object.keys(local), ...Object.keys(remote)]);
+      keys.forEach(key=>{
+        const value = mergeThreeWay(base[key], local[key], remote[key], path + '.' + key);
+        if(value !== undefined) merged[key] = value;
+      });
+      return merged;
+    }
+    throw new Error('Gelijktijdige wijzigingen botsen bij ' + path + '.');
+  }
+  function isPlainObject(value){
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+  }
+  function mergeArrayThreeWay(base, local, remote, path){
+    const all = base.concat(local, remote);
+    const records = all.length > 0 && all.every(item=>isPlainObject(item) && item.id !== undefined && item.id !== null);
+    if(records){
+      const maps = [base, local, remote].map(items=>{
+        const map = new Map();
+        items.forEach(item=>{
+          const id = String(item.id);
+          if(map.has(id)) throw new Error('Dubbele ID gevonden in ' + path + '.');
+          map.set(id, item);
+        });
+        return map;
+      });
+      const ids = new Set([...maps[2].keys(), ...maps[1].keys(), ...maps[0].keys()]);
+      const merged = [];
+      ids.forEach(id=>{
+        const item = mergeThreeWay(maps[0].get(id), maps[1].get(id), maps[2].get(id), path + '[' + id + ']');
+        if(item !== undefined) merged.push(item);
+      });
+      return merged;
+    }
+    if(all.some(value=>isPlainObject(value) || Array.isArray(value))){
+      throw new Error('Kan de gelijktijdige wijzigingen in ' + path + ' niet veilig samenvoegen.');
+    }
+    const keys = value=>new Set(value.map(item=>stableStringify(item)));
+    const baseKeys = keys(base), localKeys = keys(local), remoteKeys = keys(remote);
+    const values = new Map();
+    base.concat(local, remote).forEach(item=>values.set(stableStringify(item), item));
+    const mergedKeys = new Set();
+    values.forEach((value, key)=>{
+      const wasPresent = baseKeys.has(key);
+      const localPresent = localKeys.has(key);
+      const remotePresent = remoteKeys.has(key);
+      const localChanged = localPresent !== wasPresent;
+      const remoteChanged = remotePresent !== wasPresent;
+      if(localChanged && remoteChanged && localPresent !== remotePresent){
+        throw new Error('Gelijktijdige wijzigingen botsen bij ' + path + '.');
+      }
+      if(localPresent || remotePresent) mergedKeys.add(key);
+    });
+    const ordered = remote.concat(local, base);
+    const merged = [];
+    ordered.forEach(item=>{
+      const key = stableStringify(item);
+      if(mergedKeys.has(key)){
+        merged.push(values.get(key));
+        mergedKeys.delete(key);
+      }
+    });
+    return merged;
+  }
+  function mergeCloudStates(base, local, remote, url){
+    const merged = {
+      config: {...local.config, ...(remote.config||{}), sheetsUrl: url},
+      students: mergeThreeWay(base.students, local.students, remote.students, 'leerlingen'),
+      toys: mergeThreeWay(base.toys, local.toys, remote.toys, 'speelgoed'),
+      loans: mergeThreeWay(base.loans, local.loans, remote.loans, 'ontleningen'),
+      activeBeheerders: Array.isArray(remote.activeBeheerders) ? cloneValue(remote.activeBeheerders) : []
+    };
+    validateMergedCloudState(merged);
+    return merged;
+  }
+  function validateMergedCloudState(value){
+    const toyIds = new Set(value.toys.map(toy=>String(toy.id)));
+    const loanIds = new Set();
+    const loanedByToy = new Map();
+    value.loans.forEach(loan=>{
+      if(loanIds.has(String(loan.id))) throw new Error('Een ontlening staat dubbel in de samengevoegde gegevens.');
+      loanIds.add(String(loan.id));
+      if(!loan.teruggegeven && !toyIds.has(String(loan.toyId))){
+        throw new Error('Een ontlening verwijst naar speelgoed dat intussen verwijderd is.');
+      }
+      if(!loan.teruggegeven){
+        const toyId = String(loan.toyId);
+        loanedByToy.set(toyId, (loanedByToy.get(toyId)||0) + 1);
+      }
+    });
+    value.toys.forEach(toy=>{
+      const availableCount = Number(toy.aantal) || 1;
+      if((loanedByToy.get(String(toy.id))||0) > availableCount){
+        throw new Error('Er zijn tegelijk meer ontleningen voor "' + toy.naam + '" dan er stuks beschikbaar zijn.');
+      }
+    });
+  }
   function setCloudSyncError(message){
     cloudWritesEnabled = false;
     cloudSyncError = message;
@@ -188,46 +312,76 @@
   }
   async function pushToSheets(url){
     if(!cloudWritesEnabled || cloudSyncError) throw new Error('Synchronisatie is gepauzeerd.');
-    const expectedRevision = cloudRevision;
-    const snapshot = JSON.parse(JSON.stringify(state));
-    const body = JSON.stringify({ appVersion: APP_VERSION, expectedRevision: expectedRevision, state: snapshot });
     try{
       cloudSyncing = true;
-      let result;
-      try{
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // vermijdt een CORS-preflight richting Apps Script
-          body: body
-        });
-        if(!res.ok) throw new Error('serverfout bij opslaan (' + res.status + ')');
-        result = await res.json();
-      }catch(postError){
-        // Apps Script kan het opslaan voltooien terwijl de browser de POST-respons niet kan lezen.
-        const remote = await fetchFromSheets(url);
-        const {_empty, _revision, _requiredAppVersion, ...remoteState} = remote;
-        if(_revision === expectedRevision + 1 && JSON.stringify(remoteState) === JSON.stringify(snapshot)){
-          cloudRevision = _revision;
+      for(let attempt=0; attempt<3; attempt++){
+        if(!cloudWritesEnabled || cloudSyncError) throw new Error('Synchronisatie is gepauzeerd.');
+        const expectedRevision = cloudRevision;
+        const snapshot = cloneValue(state);
+        const base = cloneValue(cloudBaseState || cloudDataFromState(snapshot));
+        const body = JSON.stringify({ appVersion: APP_VERSION, expectedRevision: expectedRevision, state: snapshot });
+        let result = null;
+        let latest = null;
+        let postError = null;
+        try{
+          const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // vermijdt een CORS-preflight richting Apps Script
+            body: body
+          });
+          if(!res.ok) throw new Error('serverfout bij opslaan (' + res.status + ')');
+          result = await res.json();
+        }catch(e){
+          postError = e;
+          // Apps Script kan de opslag afronden terwijl de browser de POST-respons niet kan lezen.
+          latest = await fetchFromSheets(url);
+          if(latest._revision === expectedRevision + 1 &&
+              valuesEqual(cloudDataFromState(latest), cloudDataFromState(snapshot))){
+            cloudRevision = latest._revision;
+            cloudBaseState = cloudDataFromState(snapshot);
+            return;
+          }
+        }
+
+        if(result && result.updateRequired){
+          const error = new Error('Deze app-versie is verouderd. Werk de app bij om verder te gaan.');
+          error.code = 'app_update_required';
+          error.requiredAppVersion = result.requiredAppVersion;
+          throw error;
+        }
+
+        if(result && result.conflict){
+          latest = await fetchFromSheets(url);
+        } else if(result && (!result.ok || !Number.isInteger(result.revision))){
+          throw new Error('De server heeft het opslaan niet bevestigd. Controleer de Apps Script-versie.');
+        } else if(result){
+          cloudRevision = result.revision;
+          cloudBaseState = cloudDataFromState(snapshot);
           return;
         }
-        if(_revision > expectedRevision){
-          throw new Error('Een andere computer heeft intussen gegevens opgeslagen. Je wijzigingen zijn alleen lokaal bewaard.');
+
+        if(!latest || latest._revision <= expectedRevision){
+          throw new Error('De server kon de opslag niet bevestigen: ' + (postError ? postError.message : 'revisieconflict.'));
         }
-        throw new Error('De server kon de opslag niet bevestigen: ' + postError.message);
+        if(!isValidSheetsState(latest)) throw new Error('De gedeelde database bevat geen volledige gegevens.');
+
+        const remoteState = {
+          config: {...state.config, ...(latest.config||{}), sheetsUrl: url},
+          students: latest.students,
+          toys: latest.toys,
+          loans: latest.loans,
+          activeBeheerders: Array.isArray(latest.activeBeheerders) ? latest.activeBeheerders : []
+        };
+        state = mergeCloudStates(base, state, remoteState, url);
+        saveStateLocally();
+        cloudRevision = latest._revision;
+        cloudBaseState = cloudDataFromState(remoteState);
+        render();
+        toast('Gelijktijdige wijzigingen samengevoegd; opnieuw opslaan…');
+        if(attempt === 2){
+          throw new Error('Er zijn te veel gelijktijdige wijzigingen om automatisch op te slaan. Je wijzigingen zijn lokaal bewaard; download een back-up en laad daarna de nieuwste gedeelde gegevens.');
+        }
       }
-      if(result.updateRequired){
-        const error = new Error('Deze app-versie is verouderd. Werk de app bij om verder te gaan.');
-        error.code = 'app_update_required';
-        error.requiredAppVersion = result.requiredAppVersion;
-        throw error;
-      }
-      if(result.conflict){
-        throw new Error('Een andere computer heeft intussen gegevens opgeslagen. Je wijzigingen zijn alleen lokaal bewaard.');
-      }
-      if(!result.ok || !Number.isInteger(result.revision)){
-        throw new Error('De server heeft het opslaan niet bevestigd. Controleer de Apps Script-versie.');
-      }
-      cloudRevision = result.revision;
     }catch(e){
       setCloudSyncError(e.message || 'Onbekende synchronisatiefout.');
       if(e.code === 'app_update_required'){
@@ -315,6 +469,7 @@
       loans: remote.loans
     };
     cloudRevision = remote._revision;
+    cloudBaseState = cloudDataFromState(state);
     cloudWritesEnabled = true;
     cloudSyncError = '';
   }
@@ -330,6 +485,7 @@
         }
         state.config.sheetsUrl = url;
         cloudRevision = remote._revision;
+        cloudBaseState = cloudDataFromState(state);
         cloudWritesEnabled = true;
         cloudSyncError = '';
         saveStateLocally();
@@ -344,6 +500,7 @@
           loans: remote.loans
         };
         cloudRevision = remote._revision;
+        cloudBaseState = cloudDataFromState(state);
         cloudWritesEnabled = true;
         cloudSyncError = '';
         saveStateLocally();
@@ -358,6 +515,7 @@
   }
   function disconnectSheets(){
     state.config.sheetsUrl = '';
+    cloudBaseState = null;
     setData('config', state.config);
     toast('Google Sheets-koppeling verwijderd — data blijft lokaal bewaard.');
     render();
@@ -577,6 +735,7 @@
         state.students = remote.students; state.toys = remote.toys;
         state.loans = remote.loans;
         state.activeBeheerders = Array.isArray(remote.activeBeheerders) ? remote.activeBeheerders : [];
+        cloudBaseState = cloudDataFromState(state);
       } else if(fileHandleConnected()){
         await loadFromFile(fileHandle);
       }
@@ -718,6 +877,7 @@
         loans: remote.loans
       };
       cloudRevision = remote._revision;
+      cloudBaseState = cloudDataFromState(state);
       saveStateLocally();
       cloudSyncError = '';
       cloudWritesEnabled = true;
